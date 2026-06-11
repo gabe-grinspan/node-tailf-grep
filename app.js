@@ -17,7 +17,7 @@ const readRange = (filepath, start, end) => {
 	}
 };
 
-const tailF_grep = (filepath, keywords = [], excludeKeywords = [], callback, interval = 1000) => {
+const tailF_grep = (filepath, keywords, excludeKeywords, callback, interval = 1000) => {
 	// Track where we've read up to (byte offset) and which file we're reading (inode).
 	// `ino === 0` means we have no baseline yet (file absent at startup).
 	let offset = 0;
@@ -82,7 +82,19 @@ const tailF_grep = (filepath, keywords = [], excludeKeywords = [], callback, int
 	});
 };
 
-function Tail(filepath, keywords = [], excludeKeywords = [], callback) {
+// All four arguments are required. keywords/excludeKeywords are arrays (use []
+// for none); callback is always the last argument. We validate up front rather
+// than letting a misplaced argument fail deep inside the watcher.
+function Tail(filepath, keywords, excludeKeywords, callback) {
+	if (typeof filepath !== 'string') {
+		throw new TypeError('tailf-grep: filepath must be a string path to the file to follow');
+	}
+	if (!Array.isArray(keywords) || !Array.isArray(excludeKeywords)) {
+		throw new TypeError('tailf-grep: keywords and excludeKeywords must be arrays (use [] for none)');
+	}
+	if (typeof callback !== 'function') {
+		throw new TypeError('tailf-grep: callback (4th argument) must be a function');
+	}
 	this.tail = tailF_grep(filepath, keywords, excludeKeywords, callback);
 }
 
