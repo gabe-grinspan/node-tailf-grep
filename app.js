@@ -1,54 +1,85 @@
 const fs = require('fs');
 
-const getFileContent = filepath => {
-	return fs.readFileSync(filepath).toString();
-};
-
-const sleep = ms => {
-	return new Promise(resolve => setTimeout(resolve, ms));
-};
-
 const strContains = (str, keywords) => {
 	return keywords.some(keyword => str.includes(keyword));
 };
 
-const tailF_grep = async (filepath, keywords = [], excludeKeywords = [], callback) => {
+// Read bytes [start, end) from the file at `filepath` and return them as a string.
+const readRange = (filepath, start, end) => {
+	if (end <= start) return '';
+	const fd = fs.openSync(filepath, 'r');
 	try {
-		let fileContent = getFileContent(filepath);
-		let charsToTrim = fileContent.length;
-		
-		const watcher = fs.watch(filepath, async () => {
-			try {
-				if (fileContent.length > 0) {
-					charsToTrim = fileContent.length;
-				}
-				fileContent = getFileContent(filepath);
-
-				let errorContent = '';
-				if (fileContent.length === charsToTrim) {
-					// console.log('No new content');
-				} else if (fileContent.length > 0 && fileContent.length < charsToTrim) {
-					console.log('File truncated');
-					charsToTrim = fileContent.length;
-					errorContent = fileContent.split('\n').slice(-4).join('\n');
-				} else {
-					errorContent = fileContent.slice(charsToTrim);
-				}
-
-				if (errorContent.length > 0 && (keywords.length === 0 || strContains(errorContent, keywords))
-					&& (excludeKeywords.length === 0 || !strContains(errorContent, excludeKeywords))) {
-					callback(errorContent);
-				}
-			} catch (error) {
-				watcher.close();
-				await sleep(500);
-				return await tailF_grep(filepath, keywords, callback);
-			}
-		});
-	} catch (error) {
-		await sleep(500);
-		return await tailF_grep(filepath, keywords, callback);
+		const buffer = Buffer.alloc(end - start);
+		const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, start);
+		return buffer.subarray(0, bytesRead).toString();
+	} finally {
+		fs.closeSync(fd);
 	}
+};
+
+const tailF_grep = (filepath, keywords = [], excludeKeywords = [], callback, interval = 1000) => {
+	// Track where we've read up to (byte offset) and which file we're reading (inode).
+	// `ino === 0` means we have no baseline yet (file absent at startup).
+	let offset = 0;
+	let ino = 0;
+	try {
+		const stats = fs.statSync(filepath);
+		offset = stats.size;
+		ino = stats.ino;
+	} catch (error) {
+		// File doesn't exist yet; we'll baseline to it once it appears.
+	}
+
+	const emit = content => {
+		if (content.length > 0
+			&& (keywords.length === 0 || strContains(content, keywords))
+			&& (excludeKeywords.length === 0 || !strContains(content, excludeKeywords))) {
+			callback(content);
+		}
+	};
+
+	// fs.watchFile polls the *path* (not a file descriptor), so it keeps firing across
+	// rotations when the old file is renamed away and a new one is created in its place.
+	// This is what gives us real `tail -F` semantics; fs.watch cannot, as it binds to the inode.
+	fs.watchFile(filepath, { interval }, curr => {
+		try {
+			if (curr.ino === 0) {
+				// File is currently absent (e.g. mid-rotation gap). Keep the old baseline and wait.
+				return;
+			}
+
+			if (ino === 0) {
+				// First time we've seen the file: baseline to its current end without emitting,
+				// so we only report content written from here on.
+				offset = curr.size;
+				ino = curr.ino;
+				return;
+			}
+
+			if (curr.ino !== ino) {
+				// Rotated: the path now points to a brand-new file. Read it from the start.
+				emit(readRange(filepath, 0, curr.size));
+				offset = curr.size;
+				ino = curr.ino;
+				return;
+			}
+
+			if (curr.size < offset) {
+				// Same file, smaller than before: truncated in place (logrotate copytruncate).
+				emit(readRange(filepath, 0, curr.size));
+				offset = curr.size;
+				return;
+			}
+
+			if (curr.size > offset) {
+				emit(readRange(filepath, offset, curr.size));
+				offset = curr.size;
+			}
+		} catch (error) {
+			// Transient error (e.g. the file vanished mid-read during rotation).
+			// Leave the baseline untouched and let the next poll recover.
+		}
+	});
 };
 
 function Tail(filepath, keywords = [], excludeKeywords = [], callback) {
