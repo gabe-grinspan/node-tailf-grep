@@ -17,7 +17,20 @@ const readRange = (filepath, start, end) => {
 	}
 };
 
-const tailF_grep = (filepath, keywords, excludeKeywords, callback, interval = 1000) => {
+// Build a predicate that decides whether a line begins a new log record. Accepts a
+// RegExp (tested against the line) or a string (the line must start with it). Returns
+// null when no block matcher is configured (the whole change is treated as one unit).
+const blockStarter = blockStart => {
+	if (blockStart instanceof RegExp) return line => blockStart.test(line);
+	if (typeof blockStart === 'string') return line => line.startsWith(blockStart);
+	return null;
+};
+
+const tailF_grep = (filepath, keywords, excludeKeywords, callback, options = {}) => {
+	const interval = options.interval || 1000;
+	const startsBlock = blockStarter(options.blockStart);
+	const flushDelay = options.flushDelay || interval * 2;
+
 	// Track where we've read up to (byte offset) and which file we're reading (inode).
 	// `ino === 0` means we have no baseline yet (file absent at startup).
 	let offset = 0;
@@ -30,12 +43,77 @@ const tailF_grep = (filepath, keywords, excludeKeywords, callback, interval = 10
 		// File doesn't exist yet; we'll baseline to it once it appears.
 	}
 
-	const emit = content => {
-		if (content.length > 0
-			&& (keywords.length === 0 || strContains(content, keywords))
-			&& (excludeKeywords.length === 0 || !strContains(content, excludeKeywords))) {
-			callback(content);
+	// In block mode a record can span polls, so `carry` holds the trailing, not-yet-complete
+	// record until the next record begins (or `flushDelay` elapses with no new writes).
+	let carry = '';
+	let flushTimer = null;
+
+	const report = record => {
+		if (record.length > 0
+			&& (keywords.length === 0 || strContains(record, keywords))
+			&& (excludeKeywords.length === 0 || !strContains(record, excludeKeywords))) {
+			callback(record);
 		}
+	};
+
+	// Emit the held record if no further lines arrive — otherwise the last record of a burst
+	// would never be reported (watchFile only fires again when the file actually changes).
+	const scheduleFlush = () => {
+		if (flushTimer) clearTimeout(flushTimer);
+		if (carry.length === 0) {
+			flushTimer = null;
+			return;
+		}
+		flushTimer = setTimeout(() => {
+			flushTimer = null;
+			const pending = carry;
+			carry = '';
+			report(pending);
+		}, flushDelay);
+		if (flushTimer.unref) flushTimer.unref();
+	};
+
+	const flushCarry = () => {
+		if (flushTimer) {
+			clearTimeout(flushTimer);
+			flushTimer = null;
+		}
+		if (carry.length === 0) return;
+		const pending = carry;
+		carry = '';
+		report(pending);
+	};
+
+	// Feed newly-read text through the filter. Without a block matcher the whole piece is one
+	// unit (1.0.x behaviour). With one, it is split into records that are each filtered
+	// independently, so noise in one record cannot suppress a real match in another.
+	const consume = text => {
+		if (!startsBlock) {
+			report(text);
+			return;
+		}
+		const lines = (carry + text).split('\n');
+		const starts = [];
+		for (let i = 0; i < lines.length; i++) {
+			if (startsBlock(lines[i])) starts.push(i);
+		}
+		if (starts.length === 0) {
+			// No record boundary seen yet — keep buffering until one appears.
+			carry = lines.join('\n');
+			scheduleFlush();
+			return;
+		}
+		// Any lines before the first boundary are a leftover fragment; emit so nothing is lost.
+		if (starts[0] > 0) {
+			report(lines.slice(0, starts[0]).join('\n'));
+		}
+		// Every record up to (but not including) the last boundary is complete.
+		for (let s = 0; s < starts.length - 1; s++) {
+			report(lines.slice(starts[s], starts[s + 1]).join('\n'));
+		}
+		// The final record may still be growing; hold it until the next record or a flush.
+		carry = lines.slice(starts[starts.length - 1]).join('\n');
+		scheduleFlush();
 	};
 
 	// fs.watchFile polls the *path* (not a file descriptor), so it keeps firing across
@@ -57,8 +135,10 @@ const tailF_grep = (filepath, keywords, excludeKeywords, callback, interval = 10
 			}
 
 			if (curr.ino !== ino) {
-				// Rotated: the path now points to a brand-new file. Read it from the start.
-				emit(readRange(filepath, 0, curr.size));
+				// Rotated: the path now points to a brand-new file. The in-flight record on the
+				// old file is finished, so flush it, then read the new file from the start.
+				flushCarry();
+				consume(readRange(filepath, 0, curr.size));
 				offset = curr.size;
 				ino = curr.ino;
 				return;
@@ -66,13 +146,14 @@ const tailF_grep = (filepath, keywords, excludeKeywords, callback, interval = 10
 
 			if (curr.size < offset) {
 				// Same file, smaller than before: truncated in place (logrotate copytruncate).
-				emit(readRange(filepath, 0, curr.size));
+				flushCarry();
+				consume(readRange(filepath, 0, curr.size));
 				offset = curr.size;
 				return;
 			}
 
 			if (curr.size > offset) {
-				emit(readRange(filepath, offset, curr.size));
+				consume(readRange(filepath, offset, curr.size));
 				offset = curr.size;
 			}
 		} catch (error) {
@@ -82,10 +163,15 @@ const tailF_grep = (filepath, keywords, excludeKeywords, callback, interval = 10
 	});
 };
 
-// All four arguments are required. keywords/excludeKeywords are arrays (use []
-// for none); callback is always the last argument. We validate up front rather
-// than letting a misplaced argument fail deep inside the watcher.
-function Tail(filepath, keywords, excludeKeywords, callback) {
+// All four leading arguments are required. keywords/excludeKeywords are arrays (use []
+// for none); callback is always the 4th argument. `options` is optional:
+//   options.blockStart  RegExp | string — a new log record begins at any line matching this;
+//                       other lines are continuations. Lets multi-line records (e.g. stack
+//                       traces) be kept whole and filtered independently of their neighbours.
+//   options.interval    number (ms) — poll interval, default 1000.
+//   options.flushDelay  number (ms) — how long to wait for more lines before emitting a
+//                       trailing record, default interval * 2 (only used with blockStart).
+function Tail(filepath, keywords, excludeKeywords, callback, options = {}) {
 	if (typeof filepath !== 'string') {
 		throw new TypeError('tailf-grep: filepath must be a string path to the file to follow');
 	}
@@ -95,7 +181,11 @@ function Tail(filepath, keywords, excludeKeywords, callback) {
 	if (typeof callback !== 'function') {
 		throw new TypeError('tailf-grep: callback (4th argument) must be a function');
 	}
-	this.tail = tailF_grep(filepath, keywords, excludeKeywords, callback);
+	if (options.blockStart !== undefined
+		&& !(options.blockStart instanceof RegExp) && typeof options.blockStart !== 'string') {
+		throw new TypeError('tailf-grep: options.blockStart must be a RegExp or string');
+	}
+	this.tail = tailF_grep(filepath, keywords, excludeKeywords, callback, options);
 }
 
 module.exports = Tail;
