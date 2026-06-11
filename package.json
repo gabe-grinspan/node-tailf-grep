@@ -7,7 +7,10 @@
     "test": "node app.js"
   },
   "author": "Gabriel Grinspan",
-  "repository": "https://github.com/gabriel-grinspan/node-tailf-grep",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gabe-grinspan/node-tailf-grep.git"
+  },
   "keywords": [
     "tail",
     "grep",
